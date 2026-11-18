@@ -617,6 +617,11 @@ TrinoCredential = (token as text) as record =>
 // Trino renews its own token without a browser: a request with the expired token gets 401 with only an
 // x_token_server, which hands out the new token straight away (Trino refreshes against Keycloak itself, for as
 // long as the Keycloak session lasts). A token that still works is kept.
+// When the Keycloak session itself is gone (a report reopened after a while), Trino cannot renew: its challenge
+// then asks for a browser sign-in (x_redirect_server). Refresh cannot open a browser, so polling x_token_server
+// only waited 60 s and failed with "Timed out waiting for the sign-in to finish" -- for every table of a Refresh
+// all at once. A credential error instead makes Power BI ask once to sign in again. A renewal that fails for
+// another reason is reported the same way: the stored sign-in is no longer usable.
 RefreshTrino = (resourceUrl as text, token as text) as record =>
     let
         probe = Web.Contents(TrinoBaseUrl(resourceUrl) & "/v1/statement", [
@@ -624,10 +629,19 @@ RefreshTrino = (resourceUrl as text, token as text) as record =>
             Headers = [Authorization = "Bearer " & token],
             ManualStatusHandling = {401},
             IsRetry = true]),
-        status = Value.Metadata(probe)[Response.Status]
+        status = Value.Metadata(probe)[Response.Status],
+        challenge = if status = 401 then Value.Metadata(probe)[Headers][#"WWW-Authenticate"] else "",
+        needsSignIn = Text.Contains(challenge, "x_redirect_server="),
+        renewed = if status = 401 and not needsSignIn
+            then try PollTrinoToken(ChallengeParameter(challenge, "x_token_server"), 0)
+            else null,
+        signInAgain = Extension.CredentialError(Credential.AccessDenied,
+            "Your Trino sign-in has expired. Sign in again (Data source settings > Edit permissions).")
     in
         if status <> 401 then TrinoCredential(token)
-        else TrinoCredential(PollTrinoToken(ChallengeParameter(Value.Metadata(probe)[Headers][#"WWW-Authenticate"], "x_token_server"), 0));
+        else if needsSignIn then error signInAgain
+        else if renewed[HasError] then error signInAgain
+        else TrinoCredential(renewed[Value]);
 
 // OAuth helper functions: StartLogin, FinishLogin, Refresh (Authorization Code + PKCE)
 
